@@ -1,0 +1,115 @@
+"""
+Router: /api/template
+Overlay de template com auto-crop
+"""
+
+import os
+import tempfile
+import uuid
+from fastapi import APIRouter, UploadFile, File, Form, BackgroundTasks
+from fastapi.responses import FileResponse, JSONResponse
+
+from services.utils import detect_crop, run_ffmpeg, ensure_dir
+
+router = APIRouter()
+jobs: dict = {}
+
+
+def _do_render(job_id: str, video_path: str, template_path: str,
+               y_pos: int, autocrop: bool):
+    try:
+        jobs[job_id] = {"status": "analyzing", "progress": 15, "message": "Analisando bordas..."}
+
+        video_filter = "setpts=0.909*PTS,scale=1080:-2:flags=lanczos[vid]"
+        if autocrop:
+            crop = detect_crop(video_path)
+            if crop:
+                jobs[job_id]["message"] = f"Bordas detetadas: {crop}"
+                video_filter = f"setpts=0.909*PTS,{crop},scale=1080:-2:flags=lanczos[vid]"
+
+        filtro = (
+            f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
+            f"crop=1080:1920,setsar=1[bg];"
+            f"[1:v]{video_filter};"
+            f"[bg][vid]overlay=0:{y_pos}:shortest=1[v]"
+        )
+
+        out_dir  = ensure_dir(f"/tmp/tpl_{job_id}")
+        out_path = os.path.join(out_dir, "video_template.mp4")
+
+        jobs[job_id] = {"status": "rendering", "progress": 40, "message": "Renderizando..."}
+
+        cmd = (
+            f'ffmpeg -y -stream_loop -1 -i "{template_path}" -i "{video_path}" '
+            f'-filter_complex "{filtro}" '
+            f'-map "[v]" -map 1:a '
+            f'-c:v libx264 -profile:v main -pix_fmt yuv420p -crf 20 -preset fast '
+            f'-c:a aac -ar 44100 -ac 2 -b:a 128k -movflags +faststart "{out_path}" '
+            f'-hide_banner -loglevel error'
+        )
+        ok, _ = run_ffmpeg(cmd)
+
+        # Fallback sem áudio
+        if not ok or not (os.path.exists(out_path) and os.path.getsize(out_path) > 50_000):
+            jobs[job_id]["message"] = "Tentativa sem áudio..."
+            if os.path.exists(out_path): os.remove(out_path)
+            cmd_mudo = (
+                f'ffmpeg -y -stream_loop -1 -i "{template_path}" -i "{video_path}" '
+                f'-filter_complex "{filtro}" '
+                f'-map "[v]" '
+                f'-c:v libx264 -profile:v main -pix_fmt yuv420p -crf 20 -preset fast '
+                f'-movflags +faststart "{out_path}" '
+                f'-hide_banner -loglevel error'
+            )
+            run_ffmpeg(cmd_mudo)
+
+        if os.path.exists(out_path):
+            jobs[job_id] = {
+                "status": "done", "progress": 100,
+                "message": "✅ Renderização concluída!",
+                "video": out_path
+            }
+        else:
+            jobs[job_id] = {"status": "error", "progress": 0, "message": "Falha na renderização."}
+
+    except Exception as e:
+        jobs[job_id] = {"status": "error", "progress": 0, "message": str(e)}
+
+
+@router.post("/render")
+async def render_template(
+    background_tasks: BackgroundTasks,
+    video: UploadFile = File(...),
+    template: UploadFile = File(...),
+    y_pos: int = Form(600),
+    autocrop: bool = Form(True),
+):
+    # Salva vídeo
+    sv = os.path.splitext(video.filename)[-1] or ".mp4"
+    tv = tempfile.NamedTemporaryFile(delete=False, suffix=sv)
+    tv.write(await video.read())
+    tv.close()
+
+    # Salva template
+    st_ext = os.path.splitext(template.filename)[-1] or ".mp4"
+    tt = tempfile.NamedTemporaryFile(delete=False, suffix=st_ext)
+    tt.write(await template.read())
+    tt.close()
+
+    job_id = str(uuid.uuid4())[:8]
+    jobs[job_id] = {"status": "queued", "progress": 0, "message": "Na fila..."}
+    background_tasks.add_task(_do_render, job_id, tv.name, tt.name, y_pos, autocrop)
+    return {"job_id": job_id}
+
+
+@router.get("/status/{job_id}")
+def status(job_id: str):
+    return jobs.get(job_id, {"status": "not_found"})
+
+
+@router.get("/download/{job_id}")
+def download(job_id: str):
+    job = jobs.get(job_id)
+    if not job or "video" not in job:
+        return JSONResponse({"error": "Não encontrado"}, status_code=404)
+    return FileResponse(job["video"], filename="video_template.mp4", media_type="video/mp4")
