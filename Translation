@@ -1,0 +1,175 @@
+"""
+Router: /api/translation
+Tradução de áudio: transcrição + tradução + SRT / TTS
+"""
+
+import os
+import tempfile
+import uuid
+from fastapi import APIRouter, UploadFile, File, Form, BackgroundTasks
+from fastapi.responses import FileResponse, JSONResponse
+
+from services.utils import (
+    get_model, clean_json, seconds_to_srt,
+    extract_audio_mp3, upload_and_wait, run_ffmpeg, ensure_dir, LANG_FULL
+)
+
+router = APIRouter()
+jobs: dict = {}
+
+
+def _do_translation(job_id: str, video_path: str, lang_from: str, lang_to: str,
+                     mode: str, api_key: str):
+    try:
+        jobs[job_id] = {"status": "extracting", "progress": 10, "message": "Extraindo áudio..."}
+        audio_path = extract_audio_mp3(video_path)
+
+        jobs[job_id] = {"status": "uploading", "progress": 20, "message": "Enviando para Gemini..."}
+        model = get_model(api_key)
+        audio_file = upload_and_wait(audio_path, "audio/mp3")
+
+        from_name = LANG_FULL.get(lang_from, lang_from)
+        to_name   = LANG_FULL.get(lang_to, lang_to)
+
+        jobs[job_id] = {"status": "translating", "progress": 40,
+                        "message": f"Traduzindo de {from_name} → {to_name}..."}
+
+        prompt = f"""
+        This audio is in {from_name}.
+        1. Transcribe it accurately.
+        2. Translate each segment to {to_name}.
+
+        Return ONLY pure JSON:
+        [
+          {{
+            "id": 1,
+            "inicio": 0.0,
+            "fim": 4.0,
+            "original": "original text",
+            "traduzido": "translated text"
+          }}
+        ]
+        Use float seconds for start/end. Keep segments under 5 seconds.
+        """
+
+        resp = model.generate_content(
+            [audio_file, prompt],
+            generation_config={"temperature": 0.2}
+        )
+        segments = clean_json(resp.text)
+
+        try: os.unlink(audio_path)
+        except: pass
+
+        if not segments:
+            jobs[job_id] = {"status": "error", "progress": 0, "message": "Sem segmentos traduzidos."}
+            return
+
+        out_dir = ensure_dir(f"/tmp/trans_{job_id}")
+        result  = {"segments": len(segments)}
+
+        # ── Gera SRT traduzido ──────────────────────────────────────────────
+        jobs[job_id] = {"status": "writing", "progress": 70, "message": "Gerando SRT traduzido..."}
+        srt_path = os.path.join(out_dir, f"traducao_{lang_to}.srt")
+        with open(srt_path, "w", encoding="utf-8") as f:
+            for seg in segments:
+                f.write(f"{seg['id']}\n")
+                f.write(f"{seconds_to_srt(float(seg['inicio']))} --> {seconds_to_srt(float(seg['fim']))}\n")
+                f.write(f"{seg['traduzido']}\n\n")
+        result["srt"] = srt_path
+
+        # ── TTS (opcional) ───────────────────────────────────────────────────
+        if mode in ("tts", "dubbed_video"):
+            jobs[job_id] = {"status": "tts", "progress": 80, "message": "Gerando voz com TTS..."}
+            tts_path = _generate_tts(segments, lang_to, out_dir)
+
+            if tts_path and mode == "dubbed_video":
+                jobs[job_id] = {"status": "merging", "progress": 92, "message": "Combinando vídeo + áudio..."}
+                out_vid = os.path.join(out_dir, "video_dublado.mp4")
+                cmd = (
+                    f'ffmpeg -y -i "{video_path}" -i "{tts_path}" '
+                    f'-map 0:v -map 1:a -c:v copy -c:a aac -shortest "{out_vid}" -loglevel error'
+                )
+                ok, _ = run_ffmpeg(cmd)
+                if ok:
+                    result["video"] = out_vid
+            elif tts_path:
+                result["audio"] = tts_path
+
+        jobs[job_id] = {
+            "status": "done", "progress": 100,
+            "message": f"✅ {len(segments)} segmentos traduzidos!",
+            **result
+        }
+
+    except Exception as e:
+        jobs[job_id] = {"status": "error", "progress": 0, "message": str(e)}
+
+
+def _generate_tts(segments: list, lang_to: str, out_dir: str) -> str | None:
+    """Google Cloud TTS — requer google-cloud-texttospeech instalado."""
+    try:
+        from google.cloud import texttospeech
+        from services.utils import LANG_TTS_CODE
+
+        client     = texttospeech.TextToSpeechClient()
+        lang_code  = LANG_TTS_CODE.get(lang_to, "pt-BR")
+        texto      = " ".join(s["traduzido"] for s in segments)
+
+        resp = client.synthesize_speech(
+            input=texttospeech.SynthesisInput(text=texto),
+            voice=texttospeech.VoiceSelectionParams(
+                language_code=lang_code,
+                ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL
+            ),
+            audio_config=texttospeech.AudioConfig(
+                audio_encoding=texttospeech.AudioEncoding.MP3
+            )
+        )
+        tts_path = os.path.join(out_dir, "audio_tts.mp3")
+        with open(tts_path, "wb") as f:
+            f.write(resp.audio_content)
+        return tts_path
+    except Exception:
+        return None
+
+
+@router.post("/translate")
+async def translate_video(
+    background_tasks: BackgroundTasks,
+    video: UploadFile = File(...),
+    lang_from: str = Form("en"),
+    lang_to: str = Form("pt"),
+    mode: str = Form("srt"),   # srt | tts | dubbed_video
+    api_key: str = Form(...),
+):
+    suffix = os.path.splitext(video.filename)[-1] or ".mp4"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.write(await video.read())
+    tmp.close()
+
+    job_id = str(uuid.uuid4())[:8]
+    jobs[job_id] = {"status": "queued", "progress": 0, "message": "Na fila..."}
+    background_tasks.add_task(_do_translation, job_id, tmp.name, lang_from, lang_to, mode, api_key)
+    return {"job_id": job_id}
+
+
+@router.get("/status/{job_id}")
+def status(job_id: str):
+    return jobs.get(job_id, {"status": "not_found"})
+
+
+@router.get("/download/srt/{job_id}")
+def dl_srt(job_id: str):
+    job = jobs.get(job_id)
+    if not job or "srt" not in job:
+        return JSONResponse({"error": "Não encontrado"}, status_code=404)
+    return FileResponse(job["srt"], filename="traducao.srt", media_type="text/plain")
+
+
+@router.get("/download/video/{job_id}")
+def dl_video(job_id: str):
+    job = jobs.get(job_id)
+    if not job or "video" not in job:
+        return JSONResponse({"error": "Não disponível"}, status_code=404)
+    return FileResponse(job["video"], filename="video_dublado.mp4", media_type="video/mp4")
