@@ -1,0 +1,50 @@
+"""
+╔══════════════════════════════════════════════════════╗
+║    ESTÚDIO VIRAL PRO — FastAPI Backend               ║
+║    Deploy: Railway  |  Frontend: Vercel              ║
+╚══════════════════════════════════════════════════════╝
+"""
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import os
+
+from routers import cuts, subtitles, translation, template
+
+app = FastAPI(
+    title="Estúdio Viral Pro API",
+    description="API de edição de vídeo com IA (Gemini)",
+    version="1.0.0",
+)
+
+# ── CORS (permite o frontend do Vercel falar com este backend) ──
+origins = [
+    "http://localhost:5173",       # dev local
+    "http://localhost:3000",
+    os.getenv("FRONTEND_URL", "*"), # URL do Vercel em produção
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Routers ──
+app.include_router(cuts.router,        prefix="/api/cuts",       tags=["Cortes"])
+app.include_router(subtitles.router,   prefix="/api/subtitles",  tags=["Legendas"])
+app.include_router(translation.router, prefix="/api/translation",tags=["Tradução"])
+app.include_router(template.router,    prefix="/api/template",   tags=["Template"])
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "app": "Estúdio Viral Pro API v1.0"}
+
+
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
