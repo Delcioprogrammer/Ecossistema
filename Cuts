@@ -1,0 +1,144 @@
+"""
+Router: /api/cuts
+Cortes automáticos com análise visual do Gemini
+"""
+
+import os
+import re
+import tempfile
+from fastapi import APIRouter, UploadFile, File, Form, BackgroundTasks
+from fastapi.responses import JSONResponse, FileResponse
+import zipfile
+
+from services.utils import (
+    get_model, clean_json, time_to_seconds, upload_and_wait, run_ffmpeg, ensure_dir
+)
+
+router = APIRouter()
+
+# Armazena estado dos jobs em memória (produção: usar Redis)
+jobs: dict = {}
+
+
+def _do_analysis(job_id: str, video_path: str, instructions: str, speed: float, api_key: str):
+    try:
+        jobs[job_id] = {"status": "uploading", "progress": 10, "message": "Enviando para Gemini..."}
+        model = get_model(api_key)
+        video_file = upload_and_wait(video_path)
+
+        jobs[job_id] = {"status": "analyzing", "progress": 35, "message": "Gemini a analisar o vídeo..."}
+
+        prompt = f"""
+        You are an expert Video Editor specializing in viral content and visual analysis.
+
+        TASK: Watch this video and identify the BEST moments for cuts based on VISUAL ACTION and IMPACT.
+
+        WHAT THE USER WANTS: "{instructions or 'Visually impactful moments, intense action, emotional reactions'}"
+
+        GUIDELINES:
+        1. GAMEPLAY: identify Kills, Goals, fast movements, epic moments.
+        2. PODCAST/VLOG: identify laughter, surprise expressions, emotional peaks.
+        3. Include visually interesting moments even without speech.
+        4. Each cut should be between 10 and 60 seconds.
+        5. Find AT LEAST 3 and AT MOST 8 cuts.
+
+        Return ONLY pure JSON (no extra text):
+        [
+          {{ "inicio": "MM:SS", "fim": "MM:SS", "titulo": "short_snake_case_description" }}
+        ]
+        """
+
+        resp = model.generate_content(
+            [video_file, prompt],
+            generation_config={"temperature": 0.4}
+        )
+        cuts = clean_json(resp.text)
+
+        if not cuts:
+            jobs[job_id] = {"status": "error", "progress": 0, "message": "Nenhum corte encontrado."}
+            return
+
+        jobs[job_id] = {"status": "cutting", "progress": 55, "message": f"{len(cuts)} cortes! Gerando clipes..."}
+
+        # Gera os clipes com FFmpeg
+        out_dir = ensure_dir(f"/tmp/cuts_{job_id}")
+        file_list = []
+
+        for i, c in enumerate(cuts):
+            start = max(0, time_to_seconds(c["inicio"]) - 1.5)
+            end   = time_to_seconds(c["fim"]) + 1.5
+
+            safe  = re.sub(r"[^a-zA-Z0-9_]", "", c.get("titulo", f"corte_{i+1}"))[:30]
+            out   = os.path.join(out_dir, f"Corte_{i+1:02d}_{safe}.mp4")
+
+            spd_filter = f",setpts={1/speed:.4f}*PTS" if speed != 1.0 else ""
+            afilter    = f",atempo={speed:.2f}" if speed != 1.0 else ""
+
+            cmd = (
+                f'ffmpeg -y -ss {start} -to {end} -i "{video_path}" '
+                f'-vf "scale=1080:-2{spd_filter}" '
+                f'-af "aresample=44100{afilter}" '
+                f'-c:v libx264 -crf 23 -preset fast '
+                f'-c:a aac -b:a 128k "{out}" -loglevel error'
+            )
+            run_ffmpeg(cmd)
+            if os.path.exists(out):
+                file_list.append(out)
+
+            prog = 55 + int((i + 1) / len(cuts) * 35)
+            jobs[job_id]["progress"] = prog
+            jobs[job_id]["message"]  = f"Corte {i+1}/{len(cuts)} gerado..."
+
+        # Cria ZIP
+        zip_path = f"/tmp/cortes_{job_id}.zip"
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            for f in file_list:
+                zf.write(f, os.path.basename(f))
+
+        jobs[job_id] = {
+            "status":   "done",
+            "progress": 100,
+            "message":  f"✅ {len(file_list)} cortes prontos!",
+            "cuts":     cuts,
+            "zip":      zip_path,
+            "count":    len(file_list),
+        }
+
+    except Exception as e:
+        jobs[job_id] = {"status": "error", "progress": 0, "message": str(e)}
+
+
+@router.post("/analyze")
+async def analyze_video(
+    background_tasks: BackgroundTasks,
+    video: UploadFile = File(...),
+    instructions: str = Form(""),
+    speed: float = Form(1.1),
+    api_key: str = Form(...),
+):
+    # Salva vídeo temporariamente
+    suffix = os.path.splitext(video.filename)[-1] or ".mp4"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.write(await video.read())
+    tmp.close()
+
+    import uuid
+    job_id = str(uuid.uuid4())[:8]
+    jobs[job_id] = {"status": "queued", "progress": 0, "message": "Na fila..."}
+
+    background_tasks.add_task(_do_analysis, job_id, tmp.name, instructions, speed, api_key)
+
+    return {"job_id": job_id}
+
+
+@router.get("/status/{job_id}")
+def job_status(job_id: str):
+    return jobs.get(job_id, {"status": "not_found"})
+
+
+@router.get("/download/{job_id}")
+def download_cuts(job_id: str):
+    job = jobs.get(job_id)
+    if not job or job["status"] != "done":
+        return JSONResponse({"error": "Job não encontrado ou não concluído"}, status_code=404)
+    return FileResponse(job["zip"], filename="cortes.zip", media_type="application/zip")
