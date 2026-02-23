@@ -1,0 +1,122 @@
+"""
+Serviços partilhados: Gemini, FFmpeg, helpers
+"""
+
+import os
+import re
+import json
+import time
+import subprocess
+import tempfile
+from pathlib import Path
+from datetime import timedelta
+from typing import Callable
+
+import google.generativeai as genai
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ════════════════════════════════════════════════════════════════════════════
+
+def configure_gemini(api_key: str):
+    genai.configure(api_key=api_key)
+
+def get_model(api_key: str, model_name: str = "models/gemini-1.5-pro"):
+    configure_gemini(api_key)
+    return genai.GenerativeModel(model_name)
+
+def clean_json(text: str) -> list:
+    try:
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+        return json.loads(text.replace("```json","").replace("```","").strip())
+    except:
+        return []
+
+def seconds_to_srt(secs: float) -> str:
+    td  = timedelta(seconds=abs(secs))
+    tot = int(td.total_seconds())
+    ms  = int((td.total_seconds() - tot) * 1000)
+    h, r = divmod(tot, 3600)
+    m, s = divmod(r, 60)
+    return f"{h:02}:{m:02}:{s:02},{ms:03}"
+
+def time_to_seconds(t: str) -> float:
+    try:
+        parts = list(map(int, t.split(":")))
+        if len(parts) == 2: return parts[0]*60 + parts[1]
+        if len(parts) == 3: return parts[0]*3600 + parts[1]*60 + parts[2]
+    except:
+        pass
+    return 0.0
+
+def run_ffmpeg(cmd: str) -> tuple[bool, str]:
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    return r.returncode == 0, r.stderr
+
+def ffprobe_duration(path: str) -> float:
+    cmd = f'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{path}"'
+    try:
+        return float(subprocess.check_output(cmd, shell=True).decode().strip())
+    except:
+        return 0.0
+
+def ensure_dir(path: str) -> str:
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def upload_and_wait(file_path: str, mime_type: str = None) -> object:
+    """Faz upload para o Gemini Files API e aguarda processamento."""
+    kwargs = {"path": file_path}
+    if mime_type:
+        kwargs["mime_type"] = mime_type
+    f = genai.upload_file(**kwargs)
+    while f.state.name == "PROCESSING":
+        time.sleep(3)
+        f = genai.get_file(f.name)
+    if f.state.name == "FAILED":
+        raise RuntimeError("Gemini falhou ao processar o ficheiro.")
+    return f
+
+def extract_audio_mp3(video_path: str) -> str:
+    """Extrai áudio do vídeo como MP3 mono 16kHz."""
+    out = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False).name
+    ok, err = run_ffmpeg(
+        f'ffmpeg -y -i "{video_path}" -vn -ar 16000 -ac 1 -b:a 64k "{out}" -loglevel error'
+    )
+    if not ok:
+        raise RuntimeError(f"Falha ao extrair áudio: {err}")
+    return out
+
+def detect_crop(video_path: str) -> str | None:
+    """Detetar bordas pretas com cropdetect."""
+    try:
+        cmd = f'ffmpeg -ss 10 -t 5 -i "{video_path}" -vf cropdetect=limit=24:round=2 -f null - 2>&1'
+        out = subprocess.check_output(cmd, shell=True).decode()
+        matches = re.findall(r"(crop=\d+:\d+:\d+:\d+)", out)
+        if not matches:
+            return None
+        sugestao = matches[-1]
+        cmd_dim = f'ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "{video_path}"'
+        dims = subprocess.check_output(cmd_dim, shell=True).decode().strip()
+        ow, oh = map(int, dims.split("x"))
+        cw, ch, _, _ = map(int, sugestao.replace("crop=","").split(":"))
+        if cw < ow * 0.95 or ch < oh * 0.95:
+            return sugestao
+    except:
+        pass
+    return None
+
+LANG_FULL = {
+    "pt": "Portuguese (Brazilian)", "en": "English", "es": "Spanish",
+    "fr": "French", "de": "German", "it": "Italian", "ja": "Japanese",
+    "zh": "Chinese (Mandarin)", "ko": "Korean", "ar": "Arabic",
+}
+
+LANG_TTS_CODE = {
+    "pt": "pt-BR", "en": "en-US", "es": "es-ES",
+    "fr": "fr-FR", "de": "de-DE", "it": "it-IT",
+    "ja": "ja-JP",
+}
