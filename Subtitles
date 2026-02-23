@@ -1,0 +1,132 @@
+"""
+Router: /api/subtitles
+Geração automática de legendas com Gemini
+"""
+
+import os
+import tempfile
+import uuid
+from fastapi import APIRouter, UploadFile, File, Form, BackgroundTasks
+from fastapi.responses import FileResponse, JSONResponse
+
+from services.utils import (
+    get_model, clean_json, seconds_to_srt,
+    extract_audio_mp3, upload_and_wait, run_ffmpeg, ensure_dir
+)
+
+router = APIRouter()
+jobs: dict = {}
+
+
+def _do_subtitles(job_id: str, video_path: str, language: str, embed: bool, api_key: str):
+    try:
+        jobs[job_id] = {"status": "extracting", "progress": 10, "message": "Extraindo áudio..."}
+        audio_path = extract_audio_mp3(video_path)
+
+        jobs[job_id] = {"status": "uploading", "progress": 25, "message": "Enviando áudio para Gemini..."}
+        model = get_model(api_key)
+        audio_file = upload_and_wait(audio_path, "audio/mp3")
+
+        jobs[job_id] = {"status": "transcribing", "progress": 45, "message": f"Transcrevendo em {language}..."}
+
+        prompt = f"""
+        Transcribe this audio accurately in {language}.
+        Divide into segments of MAXIMUM 5 seconds each.
+
+        Return ONLY pure JSON (no markdown, no extra text):
+        [
+          {{ "id": 1, "inicio": 0.0, "fim": 3.5, "texto": "transcribed text here" }},
+          {{ "id": 2, "inicio": 3.5, "fim": 7.2, "texto": "next segment" }}
+        ]
+        Use float seconds for start/end times.
+        """
+
+        resp = model.generate_content(
+            [audio_file, prompt],
+            generation_config={"temperature": 0.1}
+        )
+        segments = clean_json(resp.text)
+
+        if not segments:
+            jobs[job_id] = {"status": "error", "progress": 0, "message": "Sem segmentos retornados."}
+            return
+
+        jobs[job_id] = {"status": "writing", "progress": 75, "message": f"Gerando SRT ({len(segments)} linhas)..."}
+
+        out_dir  = ensure_dir(f"/tmp/subs_{job_id}")
+        srt_path = os.path.join(out_dir, "legendas.srt")
+
+        with open(srt_path, "w", encoding="utf-8") as f:
+            for seg in segments:
+                f.write(f"{seg['id']}\n")
+                f.write(f"{seconds_to_srt(float(seg['inicio']))} --> {seconds_to_srt(float(seg['fim']))}\n")
+                f.write(f"{seg['texto']}\n\n")
+
+        result = {"srt": srt_path, "segments": len(segments)}
+
+        if embed:
+            jobs[job_id] = {"status": "embedding", "progress": 88, "message": "Embutindo legendas no vídeo..."}
+            out_vid = os.path.join(out_dir, "video_legendado.mp4")
+            srt_esc = srt_path.replace("\\", "/").replace(":", "\\:")
+            cmd = (
+                f'ffmpeg -y -i "{video_path}" '
+                f'-vf "subtitles=\'{srt_esc}\':force_style=\'FontName=Arial,FontSize=20,'
+                f'PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Bold=1\'" '
+                f'-c:a copy "{out_vid}" -loglevel error'
+            )
+            ok, _ = run_ffmpeg(cmd)
+            if ok:
+                result["video"] = out_vid
+
+        jobs[job_id] = {
+            "status": "done", "progress": 100,
+            "message": f"✅ {len(segments)} legendas geradas!",
+            **result
+        }
+
+        try: os.unlink(audio_path)
+        except: pass
+
+    except Exception as e:
+        jobs[job_id] = {"status": "error", "progress": 0, "message": str(e)}
+
+
+@router.post("/generate")
+async def generate_subtitles(
+    background_tasks: BackgroundTasks,
+    video: UploadFile = File(...),
+    language: str = Form("Portuguese"),
+    embed: bool = Form(True),
+    api_key: str = Form(...),
+):
+    suffix = os.path.splitext(video.filename)[-1] or ".mp4"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.write(await video.read())
+    tmp.close()
+
+    job_id = str(uuid.uuid4())[:8]
+    jobs[job_id] = {"status": "queued", "progress": 0, "message": "Na fila..."}
+    background_tasks.add_task(_do_subtitles, job_id, tmp.name, language, embed, api_key)
+
+    return {"job_id": job_id}
+
+
+@router.get("/status/{job_id}")
+def status(job_id: str):
+    return jobs.get(job_id, {"status": "not_found"})
+
+
+@router.get("/download/srt/{job_id}")
+def dl_srt(job_id: str):
+    job = jobs.get(job_id)
+    if not job or "srt" not in job:
+        return JSONResponse({"error": "Não encontrado"}, status_code=404)
+    return FileResponse(job["srt"], filename="legendas.srt", media_type="text/plain")
+
+
+@router.get("/download/video/{job_id}")
+def dl_video(job_id: str):
+    job = jobs.get(job_id)
+    if not job or "video" not in job:
+        return JSONResponse({"error": "Não encontrado"}, status_code=404)
+    return FileResponse(job["video"], filename="video_legendado.mp4", media_type="video/mp4")
